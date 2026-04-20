@@ -43,3 +43,6 @@ uv.lock
 # Local project docs
 CLAUDE.md
 .claude/
+
+# workmux hooks
+.github/hooks
