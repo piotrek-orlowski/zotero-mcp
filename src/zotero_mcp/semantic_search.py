@@ -98,6 +98,9 @@ class ZoteroSemanticSearch:
         self._reranker: CrossEncoderReranker | None = None
         self._reranker_config = self._load_reranker_config()
 
+        # Pre-embedding text-extraction cleanup config
+        self._extraction_config = self._load_extraction_config()
+
     def _load_reranker_config(self) -> dict[str, Any]:
         """Load reranker configuration from file or use defaults."""
         config: dict[str, Any] = {
@@ -112,6 +115,21 @@ class ZoteroSemanticSearch:
                     config.update(file_config.get("semantic_search", {}).get("reranker", {}))
             except Exception as e:
                 logger.warning(f"Error loading reranker config: {e}")
+        return config
+
+    def _load_extraction_config(self) -> dict[str, Any]:
+        """Load pre-embedding extraction/cleanup config. Defaults-on."""
+        config: dict[str, Any] = {
+            "strip_boilerplate": True,
+            "skip_to_abstract": True,
+        }
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as f:
+                    file_config = json.load(f)
+                    config.update(file_config.get("semantic_search", {}).get("extraction", {}))
+            except Exception as e:
+                logger.warning(f"Error loading extraction config: {e}")
         return config
 
     def _get_reranker(self) -> CrossEncoderReranker | None:
@@ -931,6 +949,12 @@ class ZoteroSemanticSearch:
                 # Create document text and metadata
                 # Always include structured fields; append fulltext when available
                 fulltext = item.get("data", {}).get("fulltext", "")
+                if fulltext and self._extraction_config.get("strip_boilerplate", True):
+                    from .text_filters import strip_boilerplate
+                    fulltext = strip_boilerplate(
+                        fulltext,
+                        skip_to_abstract=self._extraction_config.get("skip_to_abstract", True),
+                    )
                 structured_text = self._create_document_text(item)
                 if fulltext.strip():
                     doc_text = (structured_text + "\n\n" + fulltext) if structured_text.strip() else fulltext
