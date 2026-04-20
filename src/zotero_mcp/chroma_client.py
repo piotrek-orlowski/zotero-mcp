@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 import logging
 
+import requests
+
 try:
     import chromadb
     from chromadb import Documents, EmbeddingFunction, Embeddings
@@ -240,6 +242,108 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
         return text
 
 
+OLLAMA_MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "nomic-embed-text":        8192,
+    "mxbai-embed-large":        512,
+    "bge-m3":                  8192,
+    "snowflake-arctic-embed":   512,
+    "snowflake-arctic-embed2": 8192,
+    "all-minilm":               256,
+    "granite-embedding":        512,
+    # Qwen3-Embedding: native max_position_embeddings is 32768 across all
+    # sizes (0.6b / 4b / 8b) per the HuggingFace model cards. Ollama's
+    # library page advertises 40K for 4b/8b but that is their server-side
+    # num_ctx default; the underlying model architecture caps at 32K, so
+    # we truncate to 32K to stay within what the weights can actually handle.
+    "qwen3-embedding":        32768,
+}
+OLLAMA_DEFAULT_CONTEXT_WINDOW = 2048
+
+
+class OllamaEmbeddingFunction(EmbeddingFunction):
+    """Custom Ollama embedding function for ChromaDB, calling /api/embed."""
+
+    def __init__(
+        self,
+        model_name: str,
+        host: str = "http://localhost:11434",
+        timeout: int = 60,
+    ):
+        self.model_name = model_name
+        self.host = host.rstrip("/")
+        self.timeout = timeout
+        # Strip the ":tag" suffix (e.g. "nomic-embed-text:latest") before
+        # looking up the context window.
+        base = model_name.split(":", 1)[0]
+        self._max_tokens = OLLAMA_MODEL_CONTEXT_WINDOWS.get(
+            base, OLLAMA_DEFAULT_CONTEXT_WINDOW
+        )
+        # Expose the same attribute name used by other providers so that
+        # ChromaClient.embedding_max_tokens works without a special case.
+        self.max_input_tokens = self._max_tokens
+
+    @staticmethod
+    def name() -> str:
+        return "ollama"
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "host": self.host,
+            "timeout": self.timeout,
+        }
+
+    @staticmethod
+    def build_from_config(config: dict[str, Any]) -> "OllamaEmbeddingFunction":
+        return OllamaEmbeddingFunction(
+            model_name=config.get("model_name", "nomic-embed-text"),
+            host=config.get("host", "http://localhost:11434"),
+            timeout=int(config.get("timeout", 60)),
+        )
+
+    def __call__(self, input: Documents) -> Embeddings:
+        """Generate embeddings via Ollama's native batched /api/embed."""
+        if not input:
+            return []
+        r = requests.post(
+            f"{self.host}/api/embed",
+            json={"model": self.model_name, "input": list(input)},
+            timeout=self.timeout,
+        )
+        if r.status_code == 404:
+            raise RuntimeError(
+                f"Ollama model '{self.model_name}' not pulled. "
+                f"Run `ollama pull {self.model_name}`."
+            )
+        r.raise_for_status()
+        body = r.json()
+        if "embeddings" not in body:
+            raise RuntimeError(f"Unexpected Ollama response: {body!r}")
+        return body["embeddings"]
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query string."""
+        return self.__call__([text])[0]
+
+    def truncate(self, texts, max_tokens: int | None = None):
+        """Character-based truncation using the model's context window.
+
+        Accepts either a single string (for the ChromaClient.truncate_text
+        callsite, which passes max_tokens) or a list of strings (batched,
+        as specified in the issue). Uses ~3 chars/token as a conservative
+        estimate when the caller does not pass max_tokens.
+        """
+        limit = max_tokens if max_tokens is not None else self._max_tokens
+        max_chars = limit * 3
+        if isinstance(texts, list):
+            return [t[:max_chars] for t in texts]
+        return texts[:max_chars]
+
+    @property
+    def embedding_max_tokens(self) -> int:
+        return self._max_tokens
+
+
 class HuggingFaceEmbeddingFunction(EmbeddingFunction):
     """Custom HuggingFace embedding function for ChromaDB using sentence-transformers."""
 
@@ -409,6 +513,28 @@ class ChromaClient:
             model_name = self.embedding_config.get("model_name", "google/embeddinggemma-300m")
             return HuggingFaceEmbeddingFunction(model_name=model_name)
 
+        elif self.embedding_model == "ollama":
+            # Ollama has no secrets, so config.json is the primary channel,
+            # env vars are a fallback, then built-in defaults.
+            ec = self.embedding_config or {}
+            model_name = (
+                ec.get("model_name")
+                or ec.get("model")
+                or os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+            )
+            host = (
+                ec.get("host")
+                or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+            )
+            timeout_raw = ec.get("timeout")
+            if timeout_raw is None:
+                timeout_raw = os.getenv("OLLAMA_TIMEOUT", "60")
+            return OllamaEmbeddingFunction(
+                model_name=model_name,
+                host=host,
+                timeout=int(timeout_raw),
+            )
+
         elif self.embedding_model not in ["default", "openai", "gemini"]:
             # Treat any other value as a HuggingFace model name
             return HuggingFaceEmbeddingFunction(model_name=self.embedding_model)
@@ -524,7 +650,8 @@ class ChromaClient:
             # its embed_query returns chunked results, not a single vector.
             _is_custom_ef = isinstance(
                 self.embedding_function,
-                (OpenAIEmbeddingFunction, GeminiEmbeddingFunction, HuggingFaceEmbeddingFunction),
+                (OpenAIEmbeddingFunction, GeminiEmbeddingFunction,
+                 HuggingFaceEmbeddingFunction, OllamaEmbeddingFunction),
             )
             if _is_custom_ef and hasattr(self.embedding_function, 'embed_query') and query_texts:
                 query_embeddings = []
@@ -647,11 +774,17 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
     }
 
     # Load configuration from file if it exists
+    ollama_section: dict[str, Any] = {}
     if config_path and os.path.exists(config_path):
         try:
             with open(config_path) as f:
                 file_config = json.load(f)
-                config.update(file_config.get("semantic_search", {}))
+                ss = file_config.get("semantic_search", {}) or {}
+                # Preserve the provider-specific "ollama" sub-section before
+                # config.update overwrites it (config.update only knows about
+                # top-level keys like embedding_model / embedding_config).
+                ollama_section = ss.get("ollama", {}) or {}
+                config.update(ss)
         except Exception as e:
             logger.warning(f"Error loading config from {config_path}: {e}")
 
@@ -681,6 +814,25 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
                 ec["base_url"] = env_base
         if ec.get("api_key"):
             config["embedding_config"] = ec
+
+    elif config["embedding_model"] == "ollama":
+        # Precedence: semantic_search.ollama.* (config.json) > OLLAMA_* env
+        # var > built-in default. The ollama block has no secrets so it is
+        # the primary config channel rather than a fallback for env vars.
+        ec = dict(config.get("embedding_config") or {})
+        if ollama_section.get("model"):
+            ec["model_name"] = ollama_section["model"]
+        elif not ec.get("model_name"):
+            ec["model_name"] = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+        if ollama_section.get("host"):
+            ec["host"] = ollama_section["host"]
+        elif not ec.get("host"):
+            ec["host"] = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        if ollama_section.get("timeout") is not None:
+            ec["timeout"] = int(ollama_section["timeout"])
+        elif ec.get("timeout") is None:
+            ec["timeout"] = int(os.getenv("OLLAMA_TIMEOUT", "60"))
+        config["embedding_config"] = ec
 
     elif config["embedding_model"] == "gemini":
         ec = dict(config.get("embedding_config") or {})

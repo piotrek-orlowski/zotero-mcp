@@ -147,6 +147,29 @@ zotero-mcp setup --semantic-config-only
 - **Default (all-MiniLM-L6-v2)**: Free, runs locally, good for most use cases
 - **OpenAI**: Better quality, requires API key (`text-embedding-3-small` or `text-embedding-3-large`)
 - **Gemini**: Better quality, requires API key (`gemini-embedding-001`)
+- **Ollama**: Fully local, runs via the [Ollama](https://ollama.com) server
+
+**Configuring Ollama as the embedding provider.** Set `embedding_model` to
+`"ollama"` and add an optional `semantic_search.ollama` block in your
+`~/.config/zotero-mcp/config.json`:
+
+```json
+{
+  "semantic_search": {
+    "embedding_model": "ollama",
+    "ollama": {
+      "model": "nomic-embed-text",
+      "host": "http://localhost:11434",
+      "timeout": 60
+    }
+  }
+}
+```
+
+Every field is optional. Each falls back to the corresponding environment
+variable (`OLLAMA_EMBEDDING_MODEL`, `OLLAMA_HOST`, `OLLAMA_TIMEOUT`) and
+then to the built-in defaults above. Pull the model first with
+`ollama pull nomic-embed-text`.
 
 **Update Frequency Options:**
 - **Manual**: Update only when you run `zotero-mcp update-db`
@@ -283,13 +306,16 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
 
 **Semantic Search:**
-- `ZOTERO_EMBEDDING_MODEL`: Embedding model to use (default, openai, gemini)
+- `ZOTERO_EMBEDDING_MODEL`: Embedding model to use (default, openai, gemini, ollama)
 - `OPENAI_API_KEY`: Your OpenAI API key (for OpenAI embeddings)
 - `OPENAI_EMBEDDING_MODEL`: OpenAI model name (text-embedding-3-small, text-embedding-3-large)
 - `OPENAI_BASE_URL`: Custom OpenAI endpoint URL (optional, for use with compatible APIs)
 - `GEMINI_API_KEY`: Your Gemini API key (for Gemini embeddings)
 - `GEMINI_EMBEDDING_MODEL`: Gemini model name (gemini-embedding-001)
 - `GEMINI_BASE_URL`: Custom Gemini endpoint URL (optional, for use with compatible APIs)
+- `OLLAMA_EMBEDDING_MODEL`: Ollama model name (default: nomic-embed-text)
+- `OLLAMA_HOST`: Ollama server URL (default: http://localhost:11434)
+- `OLLAMA_TIMEOUT`: Request timeout in seconds (default: 60)
 - `ZOTERO_DB_PATH`: Custom `zotero.sqlite` path (optional)
 
 ### Command-Line Options
