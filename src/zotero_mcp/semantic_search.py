@@ -823,10 +823,14 @@ class ZoteroSemanticSearch:
             except Exception:
                 pass
 
-            # Process items in batches
-            # Keep batch size under OpenAI's 300k token-per-request limit
-            # (25 × 8000 max tokens = 200k, well within the limit)
-            batch_size = 25
+            # Process items in batches.
+            # Heavy local embedders (qwen3-embedding:4b, bge-m3) buckle at
+            # batch=25 because each request is ~500K tokens of matmul;
+            # batch=4 keeps per-request work proportionate to 4B-param
+            # models on consumer hardware. Small embedders
+            # (nomic-embed-text, OpenAI) don't mind the smaller batch.
+            # TODO (issue): make provider-aware / configurable.
+            batch_size = 4
             seen_items = 0
             _failed_docs = []  # Collect failures for end-of-run retry
             for i in range(0, len(all_items), batch_size):
