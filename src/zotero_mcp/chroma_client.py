@@ -259,6 +259,8 @@ OLLAMA_MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # library page advertises 40K for 4b/8b but that is their server-side
     # num_ctx default; the underlying model architecture caps at 32K, so
     # we truncate to 32K to stay within what the weights can actually handle.
+    # One entry covers all tags because __init__ strips the `:tag` suffix
+    # before lookup — `qwen3-embedding:0.6b/4b/8b/latest` all resolve here.
     "qwen3-embedding":        32768,
 }
 OLLAMA_DEFAULT_CONTEXT_WINDOW = 2048
