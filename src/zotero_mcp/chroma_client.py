@@ -271,7 +271,12 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         self,
         model_name: str,
         host: str = "http://localhost:11434",
-        timeout: int = 60,
+        # 300s, not 60s: small embedders (nomic, mxbai at <300M params)
+        # return in under a second, but multi-billion-param embedders
+        # (qwen3-embedding:4b/8b, bge-m3) on CPU can take 30-60s per
+        # batch — right at the edge of a 60s budget — and cold-start
+        # the first batch after an idle period.
+        timeout: int = 300,
     ):
         self.model_name = model_name
         self.host = host.rstrip("/")
@@ -302,7 +307,7 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         return OllamaEmbeddingFunction(
             model_name=config.get("model_name", "nomic-embed-text"),
             host=config.get("host", "http://localhost:11434"),
-            timeout=int(config.get("timeout", 60)),
+            timeout=int(config.get("timeout", 300)),
         )
 
     def __call__(self, input: Documents) -> Embeddings:
@@ -577,7 +582,7 @@ class ChromaClient:
             )
             timeout_raw = ec.get("timeout")
             if timeout_raw is None:
-                timeout_raw = os.getenv("OLLAMA_TIMEOUT", "60")
+                timeout_raw = os.getenv("OLLAMA_TIMEOUT", "300")
             return OllamaEmbeddingFunction(
                 model_name=model_name,
                 host=host,
