@@ -296,10 +296,15 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         return "ollama"
 
     def get_config(self) -> dict[str, Any]:
+        # Intentionally do NOT persist `timeout`. It's operational state
+        # (how long the client waits on Ollama) — not a property of the
+        # collection. Persisting it bakes an old value into the
+        # collection config and overrides future default changes.
+        # Users still set it at runtime via
+        # `semantic_search.ollama.timeout` or OLLAMA_TIMEOUT.
         return {
             "model_name": self.model_name,
             "host": self.host,
-            "timeout": self.timeout,
         }
 
     @staticmethod
