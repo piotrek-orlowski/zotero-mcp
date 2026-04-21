@@ -927,7 +927,7 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
         if ollama_section.get("timeout") is not None:
             ec["timeout"] = int(ollama_section["timeout"])
         elif ec.get("timeout") is None:
-            ec["timeout"] = int(os.getenv("OLLAMA_TIMEOUT", "60"))
+            ec["timeout"] = int(os.getenv("OLLAMA_TIMEOUT", "300"))
         config["embedding_config"] = ec
 
     elif config["embedding_model"] == "gemini":
