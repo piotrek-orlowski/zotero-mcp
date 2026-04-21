@@ -207,6 +207,66 @@ zotero-mcp db-status
 
 The semantic search provides similarity scores and finds papers based on conceptual understanding, not just keyword matching.
 
+### Chunked indexing (passage-level retrieval)
+
+By default, `update-db` writes one row per Zotero item and truncates the
+document to the embedder's context window. Papers with a relevant passage
+buried on page 30 rank below shallower papers whose abstract matches.
+Opt in to **chunked indexing** to embed each paper in overlapping
+passages; search then returns one hit per paper with the best-matching
+passage surfaced.
+
+Enable by adding a `semantic_search.indexing.chunking` block to
+`~/.config/zotero-mcp/config.json`:
+
+```json
+{
+  "semantic_search": {
+    "indexing": {
+      "chunking": {
+        "mode": "recursive",
+        "chunk_size_tokens": 800,
+        "chunk_overlap_tokens": 80
+      }
+    }
+  }
+}
+```
+
+After enabling (or changing `chunk_size_tokens` / `chunk_overlap_tokens`),
+run `zotero-mcp update-db --force-rebuild` once — the existing
+per-paper rows must be replaced with per-chunk rows. `update-db` will
+refuse to proceed with a stale mix and will tell you which parameter
+differs.
+
+Search results gain two fields per hit: `matched_chunk_text` (the
+winning passage) and `matched_chunk_index` (the chunk's position inside
+the paper).
+
+#### Choosing chunk_size
+
+There are no defaults on purpose — the right value depends on your
+embedder. Two constraints to respect:
+
+| Constraint | How |
+|---|---|
+| **Upper bound** — must fit the embedder's context | `chunk_size_tokens ≤ 0.6 × embedding_max_tokens` (same 60% headroom used for BERT-family tokenizers). Larger values are clamped at `update-db` with a warning. |
+| **Retrieval granularity** — sensible regardless of embedder | 400–2000 tokens. Smaller → paragraph-level, more chunks per paper, finer localisation. Larger → section-level, fewer chunks, more context per chunk. Start at **800** for academic papers. |
+
+Per-embedder reference (derived from each model's
+`embedding_max_tokens`):
+
+| Model | `embedding_max_tokens` | Ceiling (`× 0.6`) | Recommended | Feasible range |
+|---|---|---|---|---|
+| all-MiniLM-L6-v2 (`default`) | 256 | 154 | 150 | 100–154 |
+| nomic-embed-text (Ollama) | 2048 | 1229 | 500–800 | 200–1229 |
+| bge-m3 | 8192 | 4915 | 800–1500 | 200–4915 |
+| qwen3-embedding (0.6b / 4b / 8b) | 32768 | 19660 | 800–2000 | 200–19660 |
+| OpenAI text-embedding-3-small | 8191 | 4914 | 800–1500 | 200–4914 |
+
+`chunk_overlap_tokens`: 10–15% of `chunk_size_tokens` is the usual rule;
+must be `< chunk_size_tokens` (validated at config load).
+
 ## 🖥️ Setup & Usage
 
 Full documentation is available at [Zotero MCP docs](https://stevenyuyy.com/zotero-mcp/).

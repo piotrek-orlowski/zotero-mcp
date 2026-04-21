@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Chunked semantic indexing (issue #3)** — opt-in passage-level
+  retrieval. When `semantic_search.indexing.chunking.mode` is
+  `"recursive"`, each Zotero item's text is split into overlapping
+  chunks, each chunk is embedded separately, and search results
+  aggregate back to one hit per paper with the matched passage
+  surfaced as `matched_chunk_text` / `matched_chunk_index`. Default
+  is unchanged (one row per paper). Includes a mode-switch safeguard
+  that requires `--force-rebuild` when `mode`, `chunk_size_tokens`,
+  or `chunk_overlap_tokens` changes. See README §Chunked indexing for
+  per-embedder chunk-size guidance.
+
 ## [0.2.2] - 2026-03-26
 
 ### Added
