@@ -17,6 +17,7 @@ try:
     import chromadb
     from chromadb import Documents, EmbeddingFunction, Embeddings
     from chromadb.config import Settings
+    from chromadb.utils.embedding_functions import register_embedding_function
 except ImportError as e:
     raise ImportError(
         "chromadb is required for semantic search. "
@@ -243,7 +244,10 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
 
 
 OLLAMA_MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "nomic-embed-text":        8192,
+    # Note: the HF model card advertises 8192, but Ollama's compiled blob
+    # caps at 2048 (verify with `ollama show nomic-embed-text` →
+    # "context length"). num_ctx above 2048 is clamped server-side.
+    "nomic-embed-text":        2048,
     "mxbai-embed-large":        512,
     "bge-m3":                  8192,
     "snowflake-arctic-embed":   512,
@@ -305,9 +309,24 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         """Generate embeddings via Ollama's native batched /api/embed."""
         if not input:
             return []
+        input = self.truncate(list(input))
         r = requests.post(
             f"{self.host}/api/embed",
-            json={"model": self.model_name, "input": list(input)},
+            # `truncate=True` asks Ollama to trim inputs to fit server-side
+            # (safety net; we also truncate client-side via self.truncate
+            # above).
+            # `options.num_ctx` is critical: Ollama's session num_ctx
+            # defaults to 2048 regardless of what the model was trained
+            # with. For embedders like nomic-embed-text (8192) or
+            # qwen3-embedding (32768), we must request the full context
+            # explicitly or inputs are rejected as "exceeds context length"
+            # well below the model's true limit.
+            json={
+                "model": self.model_name,
+                "input": list(input),
+                "truncate": True,
+                "options": {"num_ctx": self._max_tokens},
+            },
             timeout=self.timeout,
         )
         if r.status_code == 404:
@@ -326,22 +345,52 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         return self.__call__([text])[0]
 
     def truncate(self, texts, max_tokens: int | None = None):
-        """Character-based truncation using the model's context window.
+        """Truncate each input to fit within the model's context window.
 
-        Accepts either a single string (for the ChromaClient.truncate_text
-        callsite, which passes max_tokens) or a list of strings (batched,
-        as specified in the issue). Uses ~3 chars/token as a conservative
-        estimate when the caller does not pass max_tokens.
+        Uses tiktoken's cl100k_base as a proxy tokenizer when available.
+        cl100k has a larger vocabulary than the BERT-family tokenizers used
+        by most Ollama embedding models (nomic-embed-text, bge-m3, etc.),
+        so cl100k *under-counts* relative to the actual model tokenizer.
+        We cap at 60% of the model's limit so even the worst-case BERT
+        expansion (~1.5x cl100k tokens on dense academic text) fits under
+        the real context window.
+
+        Falls back to a conservative 1-char-per-token bound if tiktoken is
+        not installed, which guarantees the input fits regardless of
+        tokenizer choice.
+
+        Accepts either a single string (e.g. from ChromaClient.truncate_text,
+        which passes max_tokens) or a list of strings (batched).
         """
         limit = max_tokens if max_tokens is not None else self._max_tokens
-        max_chars = limit * 3
-        if isinstance(texts, list):
-            return [t[:max_chars] for t in texts]
-        return texts[:max_chars]
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("cl100k_base")
+            cap = int(limit * 0.6)
+
+            def _cap(t: str) -> str:
+                toks = enc.encode(t, disallowed_special=())
+                return t if len(toks) <= cap else enc.decode(toks[:cap])
+
+            if isinstance(texts, list):
+                return [_cap(t) for t in texts]
+            return _cap(texts)
+        except ImportError:
+            max_chars = limit  # 1 char/token worst case, always fits
+            if isinstance(texts, list):
+                return [t[:max_chars] for t in texts]
+            return texts[:max_chars]
 
     @property
     def embedding_max_tokens(self) -> int:
         return self._max_tokens
+
+
+# Register with ChromaDB's known-EF registry so that `collection.query`
+# can rebuild the class from the persisted config on an existing
+# collection. Without this, queries fail with "Could not build
+# embedding function ollama from config ...".
+register_embedding_function(OllamaEmbeddingFunction)
 
 
 class HuggingFaceEmbeddingFunction(EmbeddingFunction):
