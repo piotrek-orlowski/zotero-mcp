@@ -806,6 +806,41 @@ class ChromaClient:
         except Exception:
             return None
 
+    def get_collection_metadata(self) -> dict[str, Any]:
+        """Return the collection's persisted metadata dict (never None).
+
+        Used by the chunking safeguard to read `zmcp_chunking_*` keys. An
+        empty dict means "no prior chunking state" — the safeguard treats
+        that as first-ever indexing and does not fire.
+        """
+        try:
+            md = getattr(self.collection, "metadata", None)
+            return dict(md) if md else {}
+        except Exception:
+            return {}
+
+    def update_collection_metadata(self, kv: dict[str, Any]) -> None:
+        """Merge `kv` into the collection's persisted metadata.
+
+        Replacing metadata wholesale would wipe any unrelated keys set by
+        ChromaDB or future features, so we merge. Called on every write
+        path so the persisted state is self-healing if it was ever lost.
+        """
+        if not kv:
+            return
+        cur = self.get_collection_metadata()
+        merged = dict(cur)
+        for k, v in kv.items():
+            if v is None:
+                merged.pop(k, None)
+            else:
+                merged[k] = v
+        # `collection.modify` rejects an empty metadata dict on some
+        # versions; skip the call when there's nothing to persist.
+        if not merged:
+            return
+        self.collection.modify(metadata=merged)
+
     def get_existing_ids(self, ids: list[str]) -> set[str]:
         """Return the subset of ids that already exist in the collection."""
         if not ids:
@@ -892,7 +927,7 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
         if ollama_section.get("timeout") is not None:
             ec["timeout"] = int(ollama_section["timeout"])
         elif ec.get("timeout") is None:
-            ec["timeout"] = int(os.getenv("OLLAMA_TIMEOUT", "60"))
+            ec["timeout"] = int(os.getenv("OLLAMA_TIMEOUT", "300"))
         config["embedding_config"] = ec
 
     elif config["embedding_model"] == "gemini":

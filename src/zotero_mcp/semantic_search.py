@@ -53,6 +53,147 @@ def _truncate_to_tokens(text: str, max_tokens: int = 8000) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Chunking support (issue #3)
+#
+# Persisted keys under the `zmcp_` prefix so they can't collide with any
+# internal ChromaDB metadata. Only the three collection-defining params
+# (mode + two chunk-size fields) live here. Operational/search-side knobs
+# must NOT be persisted — see gotcha #7 in issue #1.
+# ---------------------------------------------------------------------------
+_ZMCP_KEYS = (
+    "zmcp_chunking_mode",
+    "zmcp_chunking_chunk_size_tokens",
+    "zmcp_chunking_chunk_overlap_tokens",
+)
+
+
+def _resolve_chunking_params(
+    chunking_cfg: dict,
+    ef,
+) -> tuple[int, int]:
+    """Resolve and validate chunk_size / chunk_overlap against the active
+    embedding function's max_tokens.
+
+    Refuses silent defaults; clamps with a warning on over-large values.
+    """
+    cs = chunking_cfg.get("chunk_size_tokens")
+    ov = chunking_cfg.get("chunk_overlap_tokens")
+    if cs is None or ov is None:
+        raise ValueError(
+            "mode='recursive' requires both chunk_size_tokens and "
+            "chunk_overlap_tokens in config. See docs section "
+            "'Choosing chunk_size' for per-embedder recommendations."
+        )
+    if not isinstance(cs, int) or isinstance(cs, bool) or cs <= 0:
+        raise ValueError(f"chunk_size_tokens must be a positive int, got {cs!r}")
+    if not isinstance(ov, int) or isinstance(ov, bool) or ov < 0:
+        raise ValueError(
+            f"chunk_overlap_tokens must be a non-negative int, got {ov!r}"
+        )
+    if ov >= cs:
+        raise ValueError(
+            f"chunk_overlap_tokens ({ov}) must be < chunk_size_tokens ({cs})"
+        )
+
+    ceiling = int(getattr(ef, "embedding_max_tokens", 2048) * 0.6)
+    if cs > ceiling:
+        logger.warning(
+            f"chunk_size_tokens={cs} exceeds safe embedder ceiling "
+            f"({ceiling}, = 60% of {getattr(ef, 'embedding_max_tokens', 2048)}). "
+            f"Clamping to {ceiling} to avoid per-chunk truncation. "
+            f"Consider a smaller chunk_size, or switch to an embedder "
+            f"with a larger context window."
+        )
+        cs = ceiling
+        if ov >= cs:
+            ov = max(0, cs // 8)
+    return cs, ov
+
+
+def _check_chunking_compatibility(
+    collection_metadata: dict | None,
+    config: dict,
+) -> None:
+    """Compare persisted chunking params against requested config.
+
+    Raises SystemExit with a pointer to `--force-rebuild` if anything
+    material differs. Missing persisted keys are treated as "no prior
+    chunking state" → first-ever indexing proceeds without comparison.
+    """
+    md = collection_metadata or {}
+    if not any(k in md for k in _ZMCP_KEYS):
+        return
+
+    stored_mode = md.get("zmcp_chunking_mode", "none")
+    requested_mode = config.get("mode", "none")
+    if stored_mode != requested_mode:
+        raise SystemExit(
+            f"Collection was indexed with chunking mode={stored_mode!r}, "
+            f"but config says {requested_mode!r}. "
+            f"Run `update-db --force-rebuild` to switch."
+        )
+    if requested_mode == "recursive":
+        for key, cfg_key in [
+            ("zmcp_chunking_chunk_size_tokens", "chunk_size_tokens"),
+            ("zmcp_chunking_chunk_overlap_tokens", "chunk_overlap_tokens"),
+        ]:
+            stored = md.get(key)
+            requested = config.get(cfg_key)
+            if stored is not None and stored != requested:
+                raise SystemExit(
+                    f"Collection was indexed with {cfg_key}={stored}, "
+                    f"config says {requested}. Chunk content differs; "
+                    f"mixing would produce inconsistent retrieval. "
+                    f"Run `update-db --force-rebuild` to switch."
+                )
+
+
+def _aggregate_chunk_hits(hits: list[dict], limit: int) -> list[dict]:
+    """Aggregate a best-first list of chunk hits into one hit per paper.
+
+    hits: per-hit dicts with keys {"id", "document", "metadata", ...}
+          — typically flattened from ChromaDB's nested-list response.
+    Returns up to `limit` hits, each augmented with
+    `matched_chunk_text` and `matched_chunk_index`.
+    """
+    seen: dict[str, dict] = {}
+    for h in hits:
+        meta = h.get("metadata") or {}
+        key = meta.get("parent_item_key")
+        if not key:
+            # Non-chunked row (or chunked row with no parent key): fall
+            # back to stripping the chunk suffix from the id.
+            doc_id = h.get("id", "") or ""
+            key = doc_id.split(":c")[0] if ":c" in doc_id else doc_id
+        if not key or key in seen:
+            continue
+        h2 = dict(h)
+        h2["matched_chunk_text"] = h.get("document", "")
+        h2["matched_chunk_index"] = meta.get("chunk_index", 0)
+        seen[key] = h2
+        if len(seen) >= limit:
+            break
+    return list(seen.values())
+
+
+def _chroma_results_to_hits(results: dict) -> list[dict]:
+    """Flatten a ChromaDB nested-list query response into per-hit dicts."""
+    ids = (results.get("ids") or [[]])[0]
+    distances = (results.get("distances") or [[]])[0]
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+    hits: list[dict] = []
+    for i, doc_id in enumerate(ids):
+        hits.append({
+            "id": doc_id,
+            "distance": distances[i] if i < len(distances) else None,
+            "document": documents[i] if i < len(documents) else "",
+            "metadata": metadatas[i] if i < len(metadatas) else {},
+        })
+    return hits
+
+
 class CrossEncoderReranker:
     """Optional cross-encoder re-ranker for semantic search results."""
 
@@ -101,6 +242,12 @@ class ZoteroSemanticSearch:
         # Pre-embedding text-extraction cleanup config
         self._extraction_config = self._load_extraction_config()
 
+        # Chunking config (issue #3). Collection-defining params — changing
+        # them requires --force-rebuild, enforced by the safeguard in
+        # update_database. Default is mode='none' → pipeline is byte-identical
+        # to pre-#3 behaviour.
+        self._chunking_config = self._load_chunking_config()
+
     def _load_reranker_config(self) -> dict[str, Any]:
         """Load reranker configuration from file or use defaults."""
         config: dict[str, Any] = {
@@ -130,6 +277,31 @@ class ZoteroSemanticSearch:
                     config.update(file_config.get("semantic_search", {}).get("extraction", {}))
             except Exception as e:
                 logger.warning(f"Error loading extraction config: {e}")
+        return config
+
+    def _load_chunking_config(self) -> dict[str, Any]:
+        """Load chunking configuration. Defaults to mode='none' (disabled)."""
+        config: dict[str, Any] = {
+            "mode": "none",
+            "chunk_size_tokens": None,
+            "chunk_overlap_tokens": None,
+        }
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as f:
+                    file_config = json.load(f)
+                    chunking = (
+                        file_config.get("semantic_search", {})
+                        .get("indexing", {})
+                        .get("chunking", {})
+                        or {}
+                    )
+                    config.update(chunking)
+            except Exception as e:
+                logger.warning(f"Error loading chunking config: {e}")
+        mode = config.get("mode", "none")
+        if mode not in ("none", "recursive"):
+            raise ValueError(f"Unknown chunking mode: {mode!r}")
         return config
 
     def _get_reranker(self) -> CrossEncoderReranker | None:
@@ -805,6 +977,51 @@ class ZoteroSemanticSearch:
                 logger.info("Force rebuilding database...")
                 self.chroma_client.reset_collection()
 
+            # Chunking: safeguard + persistence.
+            # The safeguard check only fires on incremental updates — a force
+            # rebuild has just wiped the collection, so there are no persisted
+            # zmcp_chunking_* keys left to compare against.
+            chunking_cfg = self._chunking_config or {}
+            if not force_full_rebuild:
+                stored_md = self.chroma_client.get_collection_metadata()
+                # Raises SystemExit with an actionable pointer to
+                # --force-rebuild when the persisted mode / chunk sizes
+                # differ from the requested config.
+                _check_chunking_compatibility(stored_md, chunking_cfg)
+
+            # Resolve (and validate) chunk params once, up front, so bad
+            # config aborts before we touch items. Refreshes the cached
+            # values the batch loop reads later.
+            if chunking_cfg.get("mode") == "recursive":
+                cs, ov = _resolve_chunking_params(
+                    chunking_cfg, self.chroma_client.embedding_function
+                )
+                # Write the resolved (possibly clamped) values back so the
+                # per-batch call inside `_process_item_batch` and the
+                # collection metadata agree.
+                self._chunking_config = {
+                    **chunking_cfg,
+                    "chunk_size_tokens": cs,
+                    "chunk_overlap_tokens": ov,
+                }
+                persist_md = {
+                    "zmcp_chunking_mode": "recursive",
+                    "zmcp_chunking_chunk_size_tokens": cs,
+                    "zmcp_chunking_chunk_overlap_tokens": ov,
+                }
+            else:
+                persist_md = {"zmcp_chunking_mode": "none"}
+            # Write every run so the persisted state is self-healing if it
+            # was ever lost; `collection.modify` is O(1) on metadata.
+            try:
+                self.chroma_client.update_collection_metadata(persist_md)
+            except Exception as e:
+                # Non-fatal: the safeguard still works on whatever metadata
+                # is there next run, and first-ever indexing proceeds.
+                logger.warning(
+                    f"Could not persist chunking metadata on collection: {e}"
+                )
+
             # Get all items from either local DB or API
             all_items = self._get_items_from_source(
                 limit=limit,
@@ -943,6 +1160,17 @@ class ZoteroSemanticSearch:
         metadatas = []
         ids = []
 
+        chunking_cfg = self._chunking_config or {}
+        mode = chunking_cfg.get("mode", "none")
+        # Resolve chunk sizes once per batch so errors surface early and the
+        # log warning for over-large chunk_size fires at most once per update.
+        if mode == "recursive":
+            chunk_size, chunk_overlap = _resolve_chunking_params(
+                chunking_cfg, self.chroma_client.embedding_function
+            )
+        else:
+            chunk_size = chunk_overlap = 0
+
         for item in items:
             try:
                 item_key = item.get("key", "")
@@ -970,14 +1198,38 @@ class ZoteroSemanticSearch:
                     stats["skipped"] += 1
                     continue
 
-                # Truncate to fit the configured embedding model's token limit
-                doc_text = self.chroma_client.truncate_text(doc_text)
-
-                documents.append(doc_text)
-                metadatas.append(metadata)
-                ids.append(item_key)
-
-                stats["processed"] += 1
+                if mode == "none":
+                    # Byte-identical to pre-#3 behaviour: truncate to the
+                    # embedder's token limit before write.
+                    doc_text = self.chroma_client.truncate_text(doc_text)
+                    documents.append(doc_text)
+                    metadatas.append(metadata)
+                    ids.append(item_key)
+                    stats["processed"] += 1
+                else:
+                    # Chunked indexing: split `doc_text` and emit one row per
+                    # chunk. The full text is NOT truncated here — each chunk
+                    # is sized (<= 60% of the embedder's context window) so
+                    # the embedder can consume it without server-side
+                    # truncation. Empty output falls back to a single row so
+                    # metadata-only items (no abstract, failed extraction)
+                    # still land in the index.
+                    from .chunker import Chunk, recursive_split
+                    chunks = recursive_split(
+                        doc_text,
+                        chunk_size_tokens=chunk_size,
+                        overlap_tokens=chunk_overlap,
+                    ) or [Chunk(doc_text, 0)]
+                    total = len(chunks)
+                    for c in chunks:
+                        chunk_meta = dict(metadata)
+                        chunk_meta["parent_item_key"] = item_key
+                        chunk_meta["chunk_index"] = c.index
+                        chunk_meta["chunk_total"] = total
+                        documents.append(c.text)
+                        metadatas.append(chunk_meta)
+                        ids.append(f"{item_key}:c{c.index:03d}")
+                    stats["processed"] += 1
 
             except Exception as e:
                 logger.error(f"Error processing item {item.get('key', 'unknown')}: {e}")
@@ -991,11 +1243,26 @@ class ZoteroSemanticSearch:
 
             try:
                 self.chroma_client.upsert_documents(documents, metadatas, ids)
-                for doc_id in ids:
-                    if doc_id in existing_ids:
-                        stats["updated"] += 1
-                    else:
-                        stats["added"] += 1
+                if mode == "recursive":
+                    # Count added/updated per parent item, not per chunk, so
+                    # the user-facing stats (`added_items`, `updated_items`)
+                    # still reflect Zotero items — consistent with the
+                    # mode='none' path and with what the CLI prints.
+                    per_parent: dict[str, list[str]] = {}
+                    for doc_id, meta in zip(ids, metadatas):
+                        parent = meta.get("parent_item_key") or doc_id
+                        per_parent.setdefault(parent, []).append(doc_id)
+                    for chunk_ids in per_parent.values():
+                        if all(cid in existing_ids for cid in chunk_ids):
+                            stats["updated"] += 1
+                        else:
+                            stats["added"] += 1
+                else:
+                    for doc_id in ids:
+                        if doc_id in existing_ids:
+                            stats["updated"] += 1
+                        else:
+                            stats["added"] += 1
             except Exception as e:
                 # Batch failed — collect failures for end-of-run retry.
                 # ChromaDB's ONNX tokenizer can fail intermittently in bursts;
@@ -1030,12 +1297,23 @@ class ZoteroSemanticSearch:
             Search results with Zotero item details
         """
         try:
+            # Chunking mode drives both over-fetch and the aggregator path.
+            # When off, the search path is byte-identical to pre-#3.
+            chunking_mode = (self._chunking_config or {}).get("mode", "none")
+            chunking_active = chunking_mode == "recursive"
+
             # Over-fetch candidates when re-ranking is enabled
             reranker = self._get_reranker()
             fetch_limit = limit
+            multiplier = 1
             if reranker:
                 multiplier = self._reranker_config.get("candidate_multiplier", 3)
                 fetch_limit = limit * multiplier
+            if chunking_active:
+                # Spec: fetch more candidates so the aggregator has enough
+                # chunks to produce `limit` unique parents. Capped at 100
+                # to keep single-query cost bounded.
+                fetch_limit = max(fetch_limit, min(limit * 10, 100))
 
             # Perform semantic search
             results = self.chroma_client.search(
@@ -1044,16 +1322,30 @@ class ZoteroSemanticSearch:
                 where=filters
             )
 
-            # Re-rank results with cross-encoder if enabled
-            if reranker and results.get("documents") and results["documents"][0]:
-                documents = results["documents"][0]
-                ranked_indices = reranker.rerank(query, documents, top_k=limit)
-                for key in ["ids", "distances", "documents", "metadatas"]:
-                    if results.get(key) and results[key][0]:
-                        results[key][0] = [results[key][0][i] for i in ranked_indices]
+            if chunking_active:
+                # Aggregate chunk hits to one per parent paper, then
+                # optionally rerank, then enrich via parent_item_key.
+                hits = _chroma_results_to_hits(results)
+                agg_target = limit * multiplier if reranker else limit
+                hits = _aggregate_chunk_hits(hits, agg_target)
+                if reranker and hits:
+                    documents = [h.get("document", "") for h in hits]
+                    ranked_indices = reranker.rerank(query, documents, top_k=limit)
+                    hits = [hits[i] for i in ranked_indices]
+                else:
+                    hits = hits[:limit]
+                enriched_results = self._enrich_hits(hits, query)
+            else:
+                # Re-rank results with cross-encoder if enabled
+                if reranker and results.get("documents") and results["documents"][0]:
+                    documents = results["documents"][0]
+                    ranked_indices = reranker.rerank(query, documents, top_k=limit)
+                    for key in ["ids", "distances", "documents", "metadatas"]:
+                        if results.get(key) and results[key][0]:
+                            results[key][0] = [results[key][0][i] for i in ranked_indices]
 
-            # Enrich results with full Zotero item data
-            enriched_results = self._enrich_search_results(results, query)
+                # Enrich results with full Zotero item data
+                enriched_results = self._enrich_search_results(results, query)
 
             return {
                 "query": query,
@@ -1114,6 +1406,43 @@ class ZoteroSemanticSearch:
                     "error": f"Could not fetch full item data: {e}"
                 })
 
+        return enriched
+
+    def _enrich_hits(self, hits: list[dict], query: str) -> list[dict[str, Any]]:
+        """Enrich aggregated chunk hits with full Zotero item data.
+
+        Parallel to `_enrich_search_results` but works from per-hit dicts
+        (already aggregated by `_aggregate_chunk_hits`) and uses
+        `parent_item_key` — not the chunk-level id — to look up the paper
+        in Zotero. Adds `matched_chunk_text` and `matched_chunk_index`
+        surfacing the best-scoring passage per paper.
+        """
+        enriched: list[dict[str, Any]] = []
+        for h in hits:
+            meta = h.get("metadata") or {}
+            parent_key = meta.get("parent_item_key")
+            if not parent_key:
+                # Row pre-dates chunking — fall back to the chunk id.
+                doc_id = h.get("id", "") or ""
+                parent_key = doc_id.split(":c")[0] if ":c" in doc_id else doc_id
+            dist = h.get("distance")
+            similarity = (1 - dist) if isinstance(dist, (int, float)) else 0
+            base = {
+                "item_key": parent_key,
+                "similarity_score": similarity,
+                "matched_text": h.get("document", ""),
+                "matched_chunk_text": h.get("matched_chunk_text", h.get("document", "")),
+                "matched_chunk_index": h.get("matched_chunk_index", meta.get("chunk_index", 0)),
+                "metadata": meta,
+                "query": query,
+            }
+            try:
+                zotero_item = self.zotero_client.item(parent_key)
+                base["zotero_item"] = zotero_item
+            except Exception as e:
+                logger.error(f"Error enriching result for item {parent_key}: {e}")
+                base["error"] = f"Could not fetch full item data: {e}"
+            enriched.append(base)
         return enriched
 
     def get_database_status(self) -> dict[str, Any]:
